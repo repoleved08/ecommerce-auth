@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"fmt"
+	"context"
 	"net/http"
 	"os"
 	"strings"
@@ -11,17 +11,15 @@ import (
 
 func JWTMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tokenString := r.Header.Get("Authorization")
-		if tokenString == "" {
-			http.Error(w, "Missing token", http.StatusUnauthorized)
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, "Authorization header required", http.StatusUnauthorized)
 			return
 		}
 
-		tokenString = strings.TrimPrefix(tokenString, "Bearer ")
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method")
-			}
 			return []byte(os.Getenv("JWT_SECRET")), nil
 		})
 
@@ -30,6 +28,27 @@ func JWTMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok || !token.Valid {
+			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
+			return
+		}
+
+		// Add user ID and role to request context
+		ctx := context.WithValue(r.Context(), "user_id", int(claims["user_id"].(float64)))
+		ctx = context.WithValue(ctx, "role", claims["role"].(string))
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+func AdminOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		role := r.Context().Value("role").(string)
+		if role != "admin" {
+			http.Error(w, "You are not authorized to perform this action", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	}
 }
