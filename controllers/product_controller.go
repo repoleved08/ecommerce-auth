@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 func AddProduct(w http.ResponseWriter, r *http.Request) {
@@ -29,18 +30,28 @@ func AddProduct(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Save the image
-	fileExt := filepath.Ext(handler.Filename)
-	imageName := fmt.Sprintf("%s%s", "product_image_", fileExt)
+	// Create unique image name
+	// Using a timestamp to ensure the filename is unique
+	timestamp := time.Now().Unix()
+	imageName := fmt.Sprintf("%d_%s", timestamp, handler.Filename)
 	imagePath := filepath.Join("uploads", imageName)
+
+	// Save the image
 	outFile, err := os.Create(imagePath)
 	if err != nil {
 		http.Error(w, "Error saving image", http.StatusInternalServerError)
 		return
 	}
 	defer outFile.Close()
-	io.Copy(outFile, file)
 
+	// Copy the file to the server
+	_, err = io.Copy(outFile, file)
+	if err != nil {
+		http.Error(w, "Error copying image", http.StatusInternalServerError)
+		return
+	}
+
+	// Store the relative path to the image in the database
 	product.ImageURL = "/uploads/" + imageName
 
 	// Extract user ID from context (JWT middleware should set this)
@@ -60,10 +71,11 @@ func AddProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Respond success
+	// Respond with the product data
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(product)
 }
+
 
 func GetAllProducts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -118,19 +130,29 @@ func UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
-	id := r.URL.Query().Get("id")
+
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+    if err != nil {
+        http.Error(w, "Invalid product ID", http.StatusBadRequest)
+        return
+    }
 
 	var product models.Product
-	err := json.NewDecoder(r.Body).Decode(&product)
+	err = json.NewDecoder(r.Body).Decode(&product)
 	if err != nil {
 		http.Error(w, "invalid input", http.StatusBadRequest)
 		return
 	}
+
 	// extracting role from jwt token
 	userRole := r.Context().Value("role").(string)
-	var productName string
+
+	//var productName string
 	var storedProduct models.Product
-	err = config.DB.QueryRow("SELECT name FROM products WHERE id=$1", id).Scan(&productName)
+
+	// Check if the product exists
+	err = config.DB.QueryRow("SELECT id, name, description, price, image_url FROM products WHERE id=$1", id).Scan(
+		&storedProduct.ID, &storedProduct.Name, &storedProduct.Description, &storedProduct.Price, &storedProduct.ImageURL)
 	if err == sql.ErrNoRows {
 		http.Error(w, "product not found", http.StatusNotFound)
 		return
@@ -139,60 +161,81 @@ func UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "error fetching products", http.StatusInternalServerError)
 		return
 	}
+
+	// Check if the user is admin
 	if userRole != "admin" {
-		http.Error(w, "you arenot allowed to update this product", http.StatusForbidden)
+		http.Error(w, "you are not allowed to update this product", http.StatusForbidden)
 		return
 	}
-	// update the product
-	_, err = config.DB.Exec("UPDATE products SET name=$1, description=$2, price=$3, image_url=$4 WHERE id=&5", product.Name, product.Description, product.Price, product.ImageURL, id)
+
+	// Perform the product update
+	_, err = config.DB.Exec("UPDATE products SET name=$1, description=$2, price=$3, image_url=$4 WHERE id=$5",
+		product.Name, product.Description, product.Price, product.ImageURL, id)
 	if err != nil {
 		http.Error(w, "error updating the product", http.StatusInternalServerError)
 		return
 	}
+
+	// Return success response with the updated product details
 	response := models.UpdateResponse{
 		Product: models.ProductDetails{
 			ID:          storedProduct.ID,
-			Name:        storedProduct.Name,
-			Description: storedProduct.Description,
-			ImageURL:    storedProduct.ImageURL,
+			Name:        product.Name,
+			Description: product.Description,
+			ImageURL:    product.ImageURL,
+			Price:       product.Price,
 		},
 		Message: "Product Updated Successfully",
 	}
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
 }
 
 func DeleteProduct(w http.ResponseWriter, r *http.Request) {
-	// Extract product ID from URL
-	id := r.URL.Query().Get("id")
+    // Extract product ID from URL and ensure it's a valid integer
+    id, err := strconv.Atoi(r.URL.Query().Get("id"))
+    if err != nil {
+        http.Error(w, "Invalid product ID", http.StatusBadRequest)
+        return
+    }
 
-	// Extract user ID from JWT token
-	userID := r.Context().Value("user_id").(int)
-	//userRole := r.Context().Value("role")
+    // Extract user ID from JWT token
+    userID, ok := r.Context().Value("user_id").(int)
+    if !ok {
+        http.Error(w, "Unauthorized", http.StatusUnauthorized)
+        return
+    }
 
-	// Verify that the product belongs to the logged-in user
-	var createdBy int
-	err := config.DB.QueryRow("SELECT created_by FROM products WHERE id = $1", id).Scan(&createdBy)
-	if err == sql.ErrNoRows {
-		http.Error(w, "Product not found", http.StatusNotFound)
-		return
-	} else if err != nil {
-		http.Error(w, "Error fetching product", http.StatusInternalServerError)
-		return
-	}
+    // Extract user role (if applicable) to restrict actions to admins
+    userRole := r.Context().Value("role").(string)
 
-	if createdBy != userID {
-		http.Error(w, "You are not allowed to delete this product", http.StatusForbidden)
-		return
-	}
+    // Verify that the product belongs to the logged-in user or user is admin
+    var createdBy int
+    err = config.DB.QueryRow("SELECT created_by FROM products WHERE id = $1", id).Scan(&createdBy)
+    if err == sql.ErrNoRows {
+        http.Error(w, "Product not found", http.StatusNotFound)
+        return
+    } else if err != nil {
+        http.Error(w, "Error fetching product", http.StatusInternalServerError)
+        return
+    }
 
-	// Delete the product
-	_, err = config.DB.Exec("DELETE FROM products WHERE id = $1", id)
-	if err != nil {
-		http.Error(w, "Error deleting product", http.StatusInternalServerError)
-		return
-	}
+    // Ensure that only the product owner or admin can delete the product
+    if createdBy != userID && userRole != "admin" {
+        http.Error(w, "You are not allowed to delete this product", http.StatusForbidden)
+        return
+    }
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "Product deleted successfully"})
+    // Delete the product
+    _, err = config.DB.Exec("DELETE FROM products WHERE id = $1", id)
+    if err != nil {
+        http.Error(w, "Error deleting product", http.StatusInternalServerError)
+        return
+    }
+
+    // Respond with success message
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]string{"message": "Product deleted successfully"})
 }
+
